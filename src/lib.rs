@@ -97,7 +97,7 @@ impl RotatingFile {
     // Increment a log file's index component by one by moving it
     fn increment_index(&self, index: usize, path: PathBuf) -> io::Result<()> {
         debug_assert_eq!(self.logfile_index(&path), Some(index));
-        fs::rename(path, self.make_filepath(index))
+        fs::rename(path, self.make_filepath(index + 1))
     }
 
     fn make_filepath(&self, index: usize) -> PathBuf {
