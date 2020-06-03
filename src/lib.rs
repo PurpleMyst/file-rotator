@@ -112,29 +112,18 @@ impl RotatingFile {
                 .max()
         })?;
 
-        let next_index = if max_index.map_or(false, |max_index| max_index >= self.max_files) {
-            // We need to make room for our new log, so let's iterate over all
-            // indices and increment each log file's index, starting from one
-            // minus the max index we have This will cause the oldest log file
-            // with index N to be overriden by the one with index N - 1, thus
-            // decreasing the total number of logs by 1 ...
-            (0..max_index.unwrap())
+        // Increment all the existing logs by one so that we can create one with index 0
+        if let Some(max_index) = max_index {
+            (0..max_index)
                 .rev()
                 .try_for_each(|index| self.increment_index(index, self.make_filepath(index)))?;
-
-            // ... allowing us to create a new log with index 0
-            0
-        } else {
-            // We have room for another log! :D
-            // Let's just create one at the next available index
-            max_index.map_or(0, |idx| idx + 1)
-        };
+        }
 
         // Make sure we pass `create_new` so that nobody tries to be sneaky and place a file under us
         fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(self.make_filepath(next_index))
+            .open(self.make_filepath(0))
     }
 
     fn current_file(&mut self) -> io::Result<&mut fs::File> {
