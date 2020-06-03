@@ -113,8 +113,9 @@ impl RotatingFile {
         })?;
 
         // Increment all the existing logs by one so that we can create one with index 0
+        // Overwrite the oldest one if we would have more than necessary
         if let Some(max_index) = max_index {
-            (0..max_index)
+            (0..max_index + if max_index >= self.max_files { 0 } else { 1 })
                 .rev()
                 .try_for_each(|index| self.increment_index(index, self.make_filepath(index)))?;
         }
