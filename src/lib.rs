@@ -1,5 +1,29 @@
 //! Simple crate that allows easy usage of rotating logfiles by faking being a
 //! single [`std::io::Write`] implementor
+//!
+//! # Alright, sure, but what's a rotating logfile?
+//!
+//! Well, imagine we are logging *a lot*, and after a while we use up all our disk space with logs.
+//! We don't want this, nobody wants this, so how do we solve it?
+//!
+//! We'll introduce the concept of changing what file we log to periodically, or in other words, we'll
+//! *rotate* our log files so that we don't generate too much stored logging.
+//!
+//! One of the concepts that is involved in rotation is a limit to how many log files can exist at once.
+//!
+//! # Examples
+//!
+//! To demostrate what was said above, here's to create a file which rotates every day, storing up to a week of logs
+//! in `/logs`
+//!
+//! ```rust
+//! file_rotator::RotatingFile::new(
+//!     "loggylog",
+//!     "/logs",
+//!     file_rotator::RotationPeriod::Interval(std::time::Duration::from_secs(60 * 60 * 24)),
+//!     7,
+//! );
+//! ```
 
 #![warn(
     missing_docs,
