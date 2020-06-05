@@ -17,11 +17,13 @@
 //! in `/logs`
 //!
 //! ```rust
-//! file_rotator::RotatingFile::new(
+//! # use std::{time::Duration, num::NonZeroUsize};
+//! # use file_rotator::{RotationPeriod, RotatingFile};
+//! RotatingFile::new(
 //!     "loggylog",
 //!     "/logs",
-//!     file_rotator::RotationPeriod::Interval(std::time::Duration::from_secs(60 * 60 * 24)),
-//!     7,
+//!     RotationPeriod::Interval(Duration::from_secs(60 * 60 * 24)),
+//!     NonZeroUsize::new(7).unwrap(),
 //! );
 //! ```
 
@@ -32,8 +34,10 @@
 )]
 
 use std::borrow::Cow;
+use std::cmp::min;
 use std::fs;
 use std::io::{self, prelude::*};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -72,7 +76,7 @@ pub struct RotatingFile {
     name: Cow<'static, str>,
     directory: PathBuf,
     rotation_tracker: RotationTracker,
-    max_files: usize,
+    max_files: NonZeroUsize,
 
     current_file: Option<fs::File>,
 }
@@ -84,7 +88,7 @@ impl RotatingFile {
         name: Name,
         directory: Directory,
         rotate_every: RotationPeriod,
-        max_files: usize,
+        max_files: NonZeroUsize,
     ) -> Self
     where
         Name: Into<Cow<'static, str>>,
@@ -136,15 +140,24 @@ impl RotatingFile {
                 .max()
         })?;
 
-        // Increment all the existing logs by one so that we can create one with index 0
-        // Overwrite the oldest one if we would have more than necessary
+        // If we already have logs, let's try to keep them under the limit
         if let Some(max_index) = max_index {
-            (0..max_index + if max_index >= self.max_files { 0 } else { 1 })
+            let max_files = self.max_files.get();
+
+            // Remove all of the ones which would push us over `max_files` if we
+            // added one
+            (max_index..=max_files)
+                .try_for_each(|index| fs::remove_file(self.make_filepath(index)))?;
+
+            // Increment all the remaining log files' indices so that we have
+            // room for a new one with index 0
+            (0..min(max_files, max_index))
                 .rev()
                 .try_for_each(|index| self.increment_index(index, self.make_filepath(index)))?;
         }
 
-        // Make sure we pass `create_new` so that nobody tries to be sneaky and place a file under us
+        // Make sure we pass `create_new` so that nobody tries to be sneaky and
+        // place a file under us
         fs::OpenOptions::new()
             .create_new(true)
             .write(true)
