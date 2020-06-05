@@ -34,7 +34,6 @@
 )]
 
 use std::borrow::Cow;
-use std::cmp::min;
 use std::fs;
 use std::io::{self, prelude::*};
 use std::num::NonZeroUsize;
@@ -81,7 +80,7 @@ pub struct RotatingFile {
     name: Cow<'static, str>,
     directory: PathBuf,
     rotation_tracker: RotationTracker,
-    max_files: NonZeroUsize,
+    max_index: usize,
 
     current_file: Option<fs::File>,
 }
@@ -103,7 +102,7 @@ impl RotatingFile {
             name: name.into(),
             directory: directory.into(),
             rotation_tracker: RotationTracker::from(rotate_every),
-            max_files,
+            max_index: max_files.get() - 1,
             current_file: None,
         }
     }
@@ -138,27 +137,36 @@ impl RotatingFile {
     }
 
     fn create_file(&self) -> io::Result<fs::File> {
-        // Find out what the biggest logfile index in the directory is
-        let max_index = itertools::process_results(fs::read_dir(&self.directory)?, |dir| {
+        // Let's survey the directory and find out what's the biggest index in there
+        let max_found_index = itertools::process_results(fs::read_dir(&self.directory)?, |dir| {
             dir.into_iter()
                 .filter_map(|entry| self.logfile_index(entry.path()))
                 .max()
         })?;
 
-        // If we already have logs, let's try to keep them under the limit
-        if let Some(max_index) = max_index {
-            let max_files = self.max_files.get();
+        // If we've found any logs, let's make sure we keep under `self.max_index`
+        if let Some(mut max_found_index) = max_found_index {
+            // First, let's check if we have the maximum amount of logs available (or maybe even more!)
+            if max_found_index >= self.max_index {
+                // If so, let's remove all of the ones >=self.max_index so that we can make room for one more
+                (self.max_index..=max_found_index)
+                    .try_for_each(|index| fs::remove_file(self.make_filepath(index)))?;
 
-            // Remove all of the ones which would push us over `max_files` if we
-            // added one
-            (max_index..=max_files)
-                .try_for_each(|index| fs::remove_file(self.make_filepath(index)))?;
+                // We'll need to update our `max_found_index` to avoid trying to
+                // move stuff that isn't there, but we'll use a saturating
+                // subtraction to handle the case where self.max_index == 0
+                // (only one logfile ever)
+                max_found_index = self.max_index.saturating_sub(1);
+            }
 
-            // Increment all the remaining log files' indices so that we have
-            // room for a new one with index 0
-            (0..min(max_files, max_index))
-                .rev()
-                .try_for_each(|index| self.increment_index(index, self.make_filepath(index)))?;
+            // If there are any logfiles remaining
+            if self.max_index != 0 {
+                // Increment all the remaining log files' indices so that we have
+                // room for a new one with index 0
+                (0..=max_found_index)
+                    .rev()
+                    .try_for_each(|index| self.increment_index(index, self.make_filepath(index)))?;
+            }
         }
 
         // Make sure we pass `create_new` so that nobody tries to be sneaky and
@@ -202,5 +210,57 @@ impl Write for RotatingFile {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.current_file()?.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::num::NonZeroUsize;
+    use std::path::Path;
+
+    use proptest::prelude::*;
+
+    use super::{RotatingFile, RotationPeriod};
+
+    fn assert_contains_files<P: AsRef<Path>>(directory: P, num: usize) {
+        let p = directory.as_ref();
+        assert_eq!(
+            fs::read_dir(p).unwrap().count(),
+            num,
+            "Directory {:?} did not contain {} file(s)",
+            p,
+            num
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 15,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn test_max_files(name in "[a-zA-Z_-]+", n in 1..25usize) {
+            let directory = tempfile::tempdir().unwrap();
+
+            let mut file = RotatingFile::new(
+                name,
+                directory.path().to_owned(),
+                RotationPeriod::Manual,
+                NonZeroUsize::new(n).unwrap(),
+            );
+
+            assert_contains_files(&directory, 0);
+            for i in 0..n {
+                file.rotate().unwrap();
+                assert_contains_files(&directory, i+1);
+            }
+
+            for _ in 0..n {
+                assert_contains_files(&directory, n);
+                file.rotate().unwrap();
+            }
+        }
     }
 }
