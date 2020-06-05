@@ -63,6 +63,11 @@ pub enum RotationPeriod {
     ///
     /// [`Instant::now`]: https://doc.rust-lang.org/std/time/struct.Instant.html#method.now
     Interval(Duration),
+
+    /// Rotate only via [`RotatingFile::rotate`]
+    ///
+    /// [`RotatingFile::rotate']: struct.RotatingFile.html#method.rotate
+    Manual,
 }
 
 mod rotation_tracker;
@@ -166,14 +171,24 @@ impl RotatingFile {
 
     fn current_file(&mut self) -> io::Result<&mut fs::File> {
         if self.should_rotate() {
-            self.current_file = Some(self.create_file()?);
-            self.rotation_tracker.reset();
+            self.rotate()?;
         }
 
         Ok(self
             .current_file
             .as_mut()
             .expect("should've been created before"))
+    }
+
+    /// Manually rotate the file out
+    ///
+    /// This is the only way that a file whose `rotation_period` is [`RotationPeriod::Manual`] can rotate.
+    ///
+    /// [`RotationPeriod::Manual`]: enum.RotationPeriod.html#variant.Manual
+    pub fn rotate(&mut self) -> io::Result<()> {
+        self.current_file = Some(self.create_file()?);
+        self.rotation_tracker.reset();
+        Ok(())
     }
 }
 

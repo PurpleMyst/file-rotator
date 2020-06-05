@@ -17,6 +17,8 @@ pub(super) enum RotationTracker {
         period: Duration,
         next_rotation: Instant,
     },
+
+    Manual,
 }
 
 fn calc_next_rotation(period: Duration) -> Instant {
@@ -33,7 +35,7 @@ impl RotationTracker {
 
             RotationTracker::Bytes { written, .. } => *written = written.saturating_add(buf.len()),
 
-            RotationTracker::Interval { .. } => {}
+            RotationTracker::Interval { .. } | RotationTracker::Manual => {}
         }
     }
 
@@ -46,6 +48,8 @@ impl RotationTracker {
             RotationTracker::Interval { next_rotation, .. } => Instant::now()
                 .checked_duration_since(*next_rotation)
                 .is_some(),
+
+            RotationTracker::Manual => false,
         }
     }
 
@@ -60,6 +64,8 @@ impl RotationTracker {
                 next_rotation,
                 period,
             } => *next_rotation = calc_next_rotation(*period),
+
+            RotationTracker::Manual => {}
         }
     }
 }
@@ -73,6 +79,7 @@ impl From<super::RotationPeriod> for RotationTracker {
                 next_rotation: calc_next_rotation(period),
                 period,
             },
+            super::RotationPeriod::Manual => Self::Manual,
         }
     }
 }
@@ -144,5 +151,15 @@ mod tests {
             std::thread::sleep(period);
             prop_assert!(tracker.should_rotate());
         }
+    }
+
+    #[test]
+    fn test_manual() {
+        let mut tracker = RotationTracker::from(RotationPeriod::Manual);
+        assert!(!tracker.should_rotate());
+        tracker.wrote(b"hello, world");
+        assert!(!tracker.should_rotate());
+        tracker.reset();
+        assert!(!tracker.should_rotate());
     }
 }
