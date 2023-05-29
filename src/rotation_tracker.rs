@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)] // idk why this is needed
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub(super) enum RotationTracker {
     Lines {

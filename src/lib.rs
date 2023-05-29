@@ -75,14 +75,33 @@ use rotation_tracker::RotationTracker;
 /// As per the name, a rotating file
 ///
 /// Handles being a fake file which will automagicaly rotate as bytes are written into it
-#[derive(Debug)]
+#[allow(missing_debug_implementations)]
 pub struct RotatingFile {
     name: Cow<'static, str>,
     directory: PathBuf,
     rotation_tracker: RotationTracker,
     max_index: usize,
 
-    current_file: Option<fs::File>,
+    compression: Compression,
+    current_file: Option<CompressedWriter>,
+}
+
+/// What compression algorithm should be used?
+#[derive(Clone, Copy, Debug)]
+pub enum Compression {
+    /// No compression, just bytes to disk.
+    None,
+    /// Zstd compression.
+    Zstd {
+        /// What level of compression should be used? As per the zstd crate's docs, zero means default.
+        level: i32,
+    },
+}
+
+#[allow(missing_debug_implementations)]
+enum CompressedWriter {
+    None(fs::File),
+    Zstd(zstd::Encoder<'static, fs::File>),
 }
 
 impl RotatingFile {
@@ -93,6 +112,7 @@ impl RotatingFile {
         directory: Directory,
         rotate_every: RotationPeriod,
         max_files: NonZeroUsize,
+        compression: Compression,
     ) -> Self
     where
         Name: Into<Cow<'static, str>>,
@@ -103,6 +123,7 @@ impl RotatingFile {
             directory: directory.into(),
             rotation_tracker: RotationTracker::from(rotate_every),
             max_index: max_files.get() - 1,
+            compression,
             current_file: None,
         }
     }
@@ -136,7 +157,7 @@ impl RotatingFile {
         self.directory.join(format!("{}.{}.log", self.name, index))
     }
 
-    fn create_file(&self) -> io::Result<fs::File> {
+    fn create_file(&self) -> io::Result<CompressedWriter> {
         // Let's survey the directory and find out what's the biggest index in there
         let max_found_index = itertools::process_results(fs::read_dir(&self.directory)?, |dir| {
             dir.into_iter()
@@ -171,13 +192,18 @@ impl RotatingFile {
 
         // Make sure we pass `create_new` so that nobody tries to be sneaky and
         // place a file under us
-        fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(self.make_filepath(0))
+            .open(self.make_filepath(0))?;
+
+        Ok(match self.compression {
+            Compression::None => CompressedWriter::None(file),
+            Compression::Zstd { level } => CompressedWriter::Zstd(zstd::Encoder::new(file, level)?),
+        })
     }
 
-    fn current_file(&mut self) -> io::Result<&mut fs::File> {
+    fn current_writer(&mut self) -> io::Result<&mut CompressedWriter> {
         if self.should_rotate() {
             self.rotate()?;
         }
@@ -194,6 +220,12 @@ impl RotatingFile {
     ///
     /// [`RotationPeriod::Manual`]: enum.RotationPeriod.html#variant.Manual
     pub fn rotate(&mut self) -> io::Result<()> {
+        match self.current_file.take() {
+            Some(CompressedWriter::Zstd(f)) => {
+                f.finish()?;
+            }
+            Some(CompressedWriter::None(..)) | None => {}
+        }
         self.current_file = Some(self.create_file()?);
         self.rotation_tracker.reset();
         Ok(())
@@ -202,14 +234,21 @@ impl RotatingFile {
 
 impl Write for RotatingFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let file = self.current_file()?;
-        let written = file.write(buf)?;
+        let writer = self.current_writer()?;
+        let written = match writer {
+            CompressedWriter::None(w) => w.write(buf)?,
+            CompressedWriter::Zstd(w) => w.write(buf)?,
+        };
         self.rotation_tracker.wrote(&buf[..written]);
         Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.current_file()?.flush()
+        let writer = self.current_writer()?;
+        match writer {
+            CompressedWriter::None(w) => w.flush(),
+            CompressedWriter::Zstd(w) => w.flush(),
+        }
     }
 }
 
@@ -249,6 +288,7 @@ mod tests {
                 directory.path().to_owned(),
                 RotationPeriod::Manual,
                 NonZeroUsize::new(n).unwrap(),
+                crate::Compression::None
             );
 
             assert_contains_files(&directory, 0);
