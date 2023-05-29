@@ -71,6 +71,7 @@ pub enum RotationPeriod {
 
 mod rotation_tracker;
 use rotation_tracker::RotationTracker;
+use zstd::stream::AutoFinishEncoder;
 
 /// As per the name, a rotating file
 ///
@@ -101,7 +102,7 @@ pub enum Compression {
 #[allow(missing_debug_implementations)]
 enum CompressedWriter {
     None(fs::File),
-    Zstd(zstd::Encoder<'static, fs::File>),
+    Zstd(AutoFinishEncoder<'static, fs::File>),
 }
 
 impl RotatingFile {
@@ -199,7 +200,7 @@ impl RotatingFile {
 
         Ok(match self.compression {
             Compression::None => CompressedWriter::None(file),
-            Compression::Zstd { level } => CompressedWriter::Zstd(zstd::Encoder::new(file, level)?),
+            Compression::Zstd { level } => CompressedWriter::Zstd(zstd::Encoder::new(file, level)?.auto_finish()),
         })
     }
 
@@ -220,12 +221,6 @@ impl RotatingFile {
     ///
     /// [`RotationPeriod::Manual`]: enum.RotationPeriod.html#variant.Manual
     pub fn rotate(&mut self) -> io::Result<()> {
-        match self.current_file.take() {
-            Some(CompressedWriter::Zstd(f)) => {
-                f.finish()?;
-            }
-            Some(CompressedWriter::None(..)) | None => {}
-        }
         self.current_file = Some(self.create_file()?);
         self.rotation_tracker.reset();
         Ok(())
