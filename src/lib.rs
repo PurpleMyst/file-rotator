@@ -132,36 +132,50 @@ impl RotatingFile {
         self.current_file.is_none() || self.rotation_tracker.should_rotate()
     }
 
-    // To calculate a given path's index it must look like this:
-    // NAME.N.log
-    // and we return the N component
+    // Paths are split into three parts: NAME.INDEX.EXTENSION
+    // NAME is user-defined and unimportant to us, while EXTENSION must be either log or log.zstd
     fn logfile_index<P: AsRef<Path>>(&self, path: P) -> Option<usize> {
-        let path = path.as_ref();
-        let filename = path.file_stem()?.to_str()?;
-        let extension = path.extension()?;
-        if filename.starts_with(self.name.as_ref()) && extension == "log" {
-            filename[self.name.len() + '.'.len_utf8()..].parse().ok()
-        } else {
-            None
+        let mut parts = path.as_ref().file_name()?.to_str()?.split('.');
+        match parts.next_back() {
+            Some("zstd") => {
+                if parts.next_back() != Some("log") {
+                    return None;
+                }
+            }
+            Some("log") => {}
+            Some(..) | None => return None,
         }
+        parts.next_back()?.parse().ok()
     }
 
-    // Increment a log file's index component by one by moving it
-    fn increment_index(&self, index: usize, path: PathBuf) -> io::Result<()> {
-        debug_assert_eq!(self.logfile_index(&path), Some(index));
+    // Increment a log file's index component by one by moving it, compressing if necessary
+    fn increment_index(&self, index: usize) -> io::Result<()> {
+        let path = self.make_filepath(index);
         let dst = self.make_filepath(index + 1);
+        debug_assert!(!dst.exists());
+        // If we're rotating out the current log file, we must compress it. Otherwise, everything's
+        // already compressed and we can just rotate
         match self.compression {
-            Compression::None => fs::rename(path, dst),
-            Compression::Zstd { level } => {
-                zstd::stream::copy_encode(fs::File::open(&path)?, fs::File::create(dst.with_extension("log.zstd"))?, level)?;
+            Compression::Zstd { level } if index == 0 => {
+                zstd::stream::copy_encode(fs::File::open(&path)?, fs::File::create(dst)?, level)?;
                 fs::remove_file(&path)?;
                 Ok(())
             }
+
+            Compression::None | Compression::Zstd { .. } => fs::rename(path, dst),
         }
     }
 
     fn make_filepath(&self, index: usize) -> PathBuf {
-        self.directory.join(format!("{}.{}.log", self.name, index))
+        self.directory.join(format!(
+            "{}.{}.{}",
+            self.name,
+            index,
+            match self.compression {
+                Compression::Zstd { .. } if index != 0 => "log.zstd",
+                Compression::None | Compression::Zstd { .. } => "log",
+            }
+        ))
     }
 
     fn create_file(&self) -> io::Result<fs::File> {
@@ -172,7 +186,7 @@ impl RotatingFile {
                 .max()
         })?;
 
-        // If we've found any logs, let's make sure we keep under `self.max_index`
+        // If we've found any logs, let's make sure we stay under `self.max_index` files.
         if let Some(mut max_found_index) = max_found_index {
             // First, let's check if we have the maximum amount of logs available (or maybe even more!)
             if max_found_index >= self.max_index {
@@ -187,13 +201,14 @@ impl RotatingFile {
                 max_found_index = self.max_index.saturating_sub(1);
             }
 
-            // If there are any logfiles remaining
+            // If we've got a non-zero max index, we've got files to shuffle around!
             if self.max_index != 0 {
                 // Increment all the remaining log files' indices so that we have
-                // room for a new one with index 0
+                // room for a new one with index 0. Make sure that we do this in reverse order so
+                // we don't trample anything!
                 (0..=max_found_index)
                     .rev()
-                    .try_for_each(|index| self.increment_index(index, self.make_filepath(index)))?;
+                    .try_for_each(|index| self.increment_index(index))?;
             }
         }
 
@@ -254,15 +269,21 @@ mod tests {
 
     use super::{RotatingFile, RotationPeriod};
 
-    fn assert_contains_files<P: AsRef<Path>>(directory: P, num: usize) {
+    #[track_caller]
+    fn assert_contains_files<P: AsRef<Path>>(
+        directory: P,
+        num: usize,
+    ) -> Result<(), TestCaseError> {
         let p = directory.as_ref();
-        assert_eq!(
+        prop_assert_eq!(
             fs::read_dir(p).unwrap().count(),
             num,
-            "Directory {:?} did not contain {} file(s)",
+            "Directory {:?} did not contain {} file(s) (at {})",
             p,
-            num
+            num,
+            std::panic::Location::caller()
         );
+        Ok(())
     }
 
     proptest! {
@@ -283,14 +304,14 @@ mod tests {
                 crate::Compression::None
             );
 
-            assert_contains_files(&directory, 0);
+            assert_contains_files(&directory, 0)?;
             for i in 0..n {
                 file.rotate().unwrap();
-                assert_contains_files(&directory, i+1);
+                assert_contains_files(&directory, i+1)?;
             }
 
             for _ in 0..n {
-                assert_contains_files(&directory, n);
+                assert_contains_files(&directory, n)?;
                 file.rotate().unwrap();
             }
         }
@@ -320,7 +341,7 @@ mod tests {
         }
 
         #[test]
-        fn test_roundtrip_zstd(name in "[a-zA-Z_-]+", level in 0..21, data: Vec<u8>) {
+        fn test_roundtrip_zstd(name in "[a-zA-Z_-]+", n in 1..25usize, level in 0..21, data: Vec<u8>) {
             use std::io::prelude::*;
 
             let directory = tempfile::tempdir().unwrap();
@@ -328,12 +349,16 @@ mod tests {
                 name,
                 directory.path().to_owned(),
                 RotationPeriod::Manual,
-                NonZeroUsize::new(10).unwrap(),
+                NonZeroUsize::new(n * 10).unwrap(),
                 crate::Compression::Zstd { level }
             );
             file.write_all(&data).unwrap();
-            file.rotate().unwrap();
-            file.write_all(&data).unwrap();
+            for i in 0..n {
+                assert_contains_files(&directory, i + 1)?;
+                file.rotate().unwrap();
+                file.write_all(&data).unwrap();
+            }
+            assert_contains_files(&directory, n + 1)?;
             drop(file);
 
             for entry in fs::read_dir(&directory).unwrap().map(Result::unwrap) {
