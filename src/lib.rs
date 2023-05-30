@@ -18,12 +18,13 @@
 //!
 //! ```rust
 //! # use std::{time::Duration, num::NonZeroUsize};
-//! # use file_rotator::{RotationPeriod, RotatingFile};
+//! # use file_rotator::{RotationPeriod, RotatingFile, Compression};
 //! RotatingFile::new(
 //!     "loggylog",
 //!     "/logs",
 //!     RotationPeriod::Interval(Duration::from_secs(60 * 60 * 24)),
 //!     NonZeroUsize::new(7).unwrap(),
+//!     Compression::None,
 //! );
 //! ```
 
@@ -44,7 +45,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Ord, PartialOrd, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RotationPeriod {
-    /// Rotate every N line terminato bytes (0x0a, b'\n')
+    /// Rotate every N line terminator bytes (0x0a, b'\n')
     Lines(usize),
 
     /// Rotate every N bytes successfully written
@@ -71,12 +72,11 @@ pub enum RotationPeriod {
 
 mod rotation_tracker;
 use rotation_tracker::RotationTracker;
-use zstd::stream::AutoFinishEncoder;
 
 /// As per the name, a rotating file
 ///
 /// Handles being a fake file which will automagicaly rotate as bytes are written into it
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct RotatingFile {
     name: Cow<'static, str>,
     directory: PathBuf,
@@ -84,10 +84,14 @@ pub struct RotatingFile {
     max_index: usize,
 
     compression: Compression,
-    current_file: Option<CompressedWriter>,
+    current_file: Option<fs::File>,
 }
 
 /// What compression algorithm should be used?
+///
+/// The current log file (`NAME.0.log`) is always written uncompressed; once its time to rotate
+/// out, compression will be applied. Depending on compression type, an extra extension might be
+/// added.
 #[derive(Clone, Copy, Debug)]
 pub enum Compression {
     /// No compression, just bytes to disk.
@@ -99,15 +103,9 @@ pub enum Compression {
     },
 }
 
-#[allow(missing_debug_implementations)]
-enum CompressedWriter {
-    None(fs::File),
-    Zstd(AutoFinishEncoder<'static, fs::File>),
-}
-
 impl RotatingFile {
-    /// Create a new rotating file with the given base name, in the given directory, rotating every given period and
-    /// with a max of a given number of files
+    /// Create a new rotating file with the given base name, in the given directory, rotating every
+    /// given period and with a max of a given number of files
     pub fn new<Name, Directory>(
         name: Name,
         directory: Directory,
@@ -151,14 +149,22 @@ impl RotatingFile {
     // Increment a log file's index component by one by moving it
     fn increment_index(&self, index: usize, path: PathBuf) -> io::Result<()> {
         debug_assert_eq!(self.logfile_index(&path), Some(index));
-        fs::rename(path, self.make_filepath(index + 1))
+        let dst = self.make_filepath(index + 1);
+        match self.compression {
+            Compression::None => fs::rename(path, dst),
+            Compression::Zstd { level } => {
+                zstd::stream::copy_encode(fs::File::open(&path)?, fs::File::create(dst.with_extension(".log.zstd"))?, level)?;
+                fs::remove_file(&path)?;
+                Ok(())
+            }
+        }
     }
 
     fn make_filepath(&self, index: usize) -> PathBuf {
         self.directory.join(format!("{}.{}.log", self.name, index))
     }
 
-    fn create_file(&self) -> io::Result<CompressedWriter> {
+    fn create_file(&self) -> io::Result<fs::File> {
         // Let's survey the directory and find out what's the biggest index in there
         let max_found_index = itertools::process_results(fs::read_dir(&self.directory)?, |dir| {
             dir.into_iter()
@@ -193,18 +199,13 @@ impl RotatingFile {
 
         // Make sure we pass `create_new` so that nobody tries to be sneaky and
         // place a file under us
-        let file = fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(self.make_filepath(0))?;
-
-        Ok(match self.compression {
-            Compression::None => CompressedWriter::None(file),
-            Compression::Zstd { level } => CompressedWriter::Zstd(zstd::Encoder::new(file, level)?.auto_finish()),
-        })
+            .open(self.make_filepath(0))
     }
 
-    fn current_writer(&mut self) -> io::Result<&mut CompressedWriter> {
+    fn current_file(&mut self) -> io::Result<&mut fs::File> {
         if self.should_rotate() {
             self.rotate()?;
         }
@@ -219,6 +220,10 @@ impl RotatingFile {
     ///
     /// This is the only way that a file whose `rotation_period` is [`RotationPeriod::Manual`] can rotate.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if one is encountered during creation of the new logfile.
+    ///
     /// [`RotationPeriod::Manual`]: enum.RotationPeriod.html#variant.Manual
     pub fn rotate(&mut self) -> io::Result<()> {
         self.current_file = Some(self.create_file()?);
@@ -228,22 +233,14 @@ impl RotatingFile {
 }
 
 impl Write for RotatingFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let writer = self.current_writer()?;
-        let written = match writer {
-            CompressedWriter::None(w) => w.write(buf)?,
-            CompressedWriter::Zstd(w) => w.write(buf)?,
-        };
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.current_file()?.write(buf)?;
         self.rotation_tracker.wrote(&buf[..written]);
         Ok(written)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        let writer = self.current_writer()?;
-        match writer {
-            CompressedWriter::None(w) => w.flush(),
-            CompressedWriter::Zstd(w) => w.flush(),
-        }
+    fn flush(&mut self) -> io::Result<()> {
+        self.current_file()?.flush()
     }
 }
 
@@ -295,6 +292,61 @@ mod tests {
             for _ in 0..n {
                 assert_contains_files(&directory, n);
                 file.rotate().unwrap();
+            }
+        }
+
+        #[test]
+        fn test_roundtrip_uncompressed(name in "[a-zA-Z_-]+", data: Vec<u8>) {
+            use std::io::prelude::*;
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut file = RotatingFile::new(
+                name,
+                directory.path().to_owned(),
+                RotationPeriod::Manual,
+                NonZeroUsize::new(10).unwrap(),
+                crate::Compression::None
+            );
+            file.write_all(&data).unwrap();
+            file.rotate().unwrap();
+            file.write_all(&data).unwrap();
+            drop(file);
+
+            for entry in fs::read_dir(&directory).unwrap().map(Result::unwrap) {
+                let path = entry.path();
+                let read = fs::read(path).unwrap();
+                prop_assert_eq!(&read, &data);
+            }
+        }
+
+        #[test]
+        fn test_roundtrip_zstd(name in "[a-zA-Z_-]+", level in 0..21, data: Vec<u8>) {
+            use std::io::prelude::*;
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut file = RotatingFile::new(
+                name,
+                directory.path().to_owned(),
+                RotationPeriod::Manual,
+                NonZeroUsize::new(10).unwrap(),
+                crate::Compression::Zstd { level }
+            );
+            file.write_all(&data).unwrap();
+            file.rotate().unwrap();
+            file.write_all(&data).unwrap();
+            drop(file);
+
+            for entry in fs::read_dir(&directory).unwrap().map(Result::unwrap) {
+                let path = entry.path();
+                let read = fs::read(&path).unwrap();
+                if path.file_stem().unwrap().to_string_lossy().ends_with(".0") {
+                    prop_assert_eq!(path.extension().unwrap().to_string_lossy(), "log");
+                    prop_assert_eq!(&read, &data);
+                } else {
+                    prop_assert_eq!(path.extension().unwrap().to_string_lossy(), "zstd");
+                    let read = zstd::decode_all(std::io::Cursor::new(read)).unwrap();
+                    prop_assert_eq!(&read, &data);
+                }
             }
         }
     }

@@ -29,7 +29,7 @@ impl RotationTracker {
     pub(super) fn wrote(&mut self, buf: &[u8]) {
         match self {
             RotationTracker::Lines { written, .. } => {
-                *written = written.saturating_add(buf.iter().filter(|&&c| c == b'\n').count())
+                *written = written.saturating_add(bytecount::count(buf, b'\n'));
             }
 
             RotationTracker::Bytes { written, .. } => *written = written.saturating_add(buf.len()),
@@ -56,7 +56,7 @@ impl RotationTracker {
     pub(super) fn reset(&mut self) {
         match self {
             RotationTracker::Lines { written, .. } | RotationTracker::Bytes { written, .. } => {
-                *written = 0
+                *written = 0;
             }
 
             RotationTracker::Interval {
