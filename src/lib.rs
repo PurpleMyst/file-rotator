@@ -153,7 +153,7 @@ impl RotatingFile {
         match self.compression {
             Compression::None => fs::rename(path, dst),
             Compression::Zstd { level } => {
-                zstd::stream::copy_encode(fs::File::open(&path)?, fs::File::create(dst.with_extension(".log.zstd"))?, level)?;
+                zstd::stream::copy_encode(fs::File::open(&path)?, fs::File::create(dst.with_extension("log.zstd"))?, level)?;
                 fs::remove_file(&path)?;
                 Ok(())
             }
