@@ -1,7 +1,7 @@
 [package]
 name = "file-rotator"
 description = "File rotation made simple"
-version = "0.5.1"
+version = "0.6.0"
 authors = ["PurpleMyst <PurpleMyst@users.noreply.github.com>"]
 readme = "README.md"
 license = "MIT"
